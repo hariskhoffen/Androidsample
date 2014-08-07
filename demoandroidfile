@@ -1,0 +1,841 @@
+
+package com.paytronix.client.android.app.activity;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.ExpandableListActivity;
+import android.app.ProgressDialog;
+import android.content.DialogInterface;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
+import android.os.AsyncTask;
+import android.os.Bundle;
+import android.preference.PreferenceManager;
+import android.util.Log;
+import android.view.View;
+import android.view.View.OnClickListener;
+import android.view.Window;
+import android.widget.Button;
+import android.widget.SimpleExpandableListAdapter;
+import android.widget.Toast;
+import android.widget.ToggleButton;
+
+import com.paytronix.client.android.api.AccountInformation;
+import com.paytronix.client.android.api.Expiration;
+import com.paytronix.client.android.api.Message;
+import com.paytronix.client.android.api.PaymentConfig;
+import com.paytronix.client.android.api.PaytronixAPI;
+import com.paytronix.client.android.api.exception.PxException;
+import com.paytronix.client.android.api.exception.PxInvalidTokenException;
+import com.paytronix.client.android.api.UserInformation;
+import com.paytronix.client.android.app.R;
+import com.paytronix.client.android.app.constants.IntentExtraKeys;
+import com.paytronix.client.android.app.util.AppUtil;
+import com.paytronix.client.android.app.util.WorkQueue;
+import com.paytronix.client.android.json.MessageJSON;
+
+/**
+ * Demonstrates expandable lists backed by a Simple Map-based adapter
+ */
+public class Balance extends ExpandableListActivity {
+    private static final String NAME = "NAME";
+    private static final String BALANCE = "BALANCE";
+    private static final String EXPIRATION = "EXPIRATION";
+
+    private SimpleExpandableListAdapter mAdapter;
+    private final List<Map<String, String>> groupData = new ArrayList<Map<String, String>>();
+    private final List<List<Map<String, String>>> childData =
+            new ArrayList<List<Map<String, String>>>();
+    private AccountInformation mAccInfo;
+
+    private AsyncTask<Void, Void, Object> mTask;
+    private WorkQueue<AsyncTask<Void, Void, Object>> mQ;
+
+    private int mRetryCountPaymentConfiguration = 0;
+
+    private static final long TEN_MINUTES = 600000;
+    private static final long THREE_MINUTES = 180000;
+    private static final String TAG = Balance.class.getSimpleName();
+
+    private static Calendar sCheckMessages;
+    private static Calendar sCheckAccountInformation;
+    private static ToggleButton select;
+    private UserInformation userInfo = null;
+
+    @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        mQ = new WorkQueue<AsyncTask<Void, Void, Object>>();
+
+        if (savedInstanceState != null) {
+
+            if (savedInstanceState.containsKey(IntentExtraKeys.PXCONTEXT_EXTRA)) {
+
+                AppUtil.sPxAPI = (PaytronixAPI)savedInstanceState.getSerializable(IntentExtraKeys
+                        .PXCONTEXT_EXTRA);
+
+            }
+
+        }
+        initialUISetup();
+
+        mQ.add(new RetrievePaymentConfigurationTask());		//Used in determining if recharge is enabled for the merchant
+        runQueue();
+
+        // Set up our adapter
+        // The points_name, points_balance and expiration ids correspond to a view
+        // in which the text style (color etc...) is specified.
+        mAdapter = new SimpleExpandableListAdapter(
+                this,
+                groupData,
+                R.layout.points_item,
+                new String[] {
+                        NAME, BALANCE
+                },
+                new int[] {
+                        R.id.points_name, R.id.points_balance
+                },
+                childData,
+                R.layout.expiration_item,
+                new String[] {
+                        EXPIRATION
+                },
+                new int[] {
+                        R.id.expiration
+                }
+                );
+
+        setListAdapter(mAdapter);
+    }
+
+    private void fillData(AccountInformation acctInfo) {
+        groupData.clear();
+        childData.clear();
+        if (acctInfo == null) {
+            return;
+        }
+        addBalance(acctInfo.getStoredValueBalance());
+        addBalance(acctInfo.getChargeBalance());
+        List<com.paytronix.client.android.api.Balance> rewards = acctInfo.getRewardBalances();
+        if (rewards != null) {
+            for (com.paytronix.client.android.api.Balance balance : rewards) {
+                addBalance(balance);
+            }
+        }
+        List<com.paytronix.client.android.api.Balance> points = acctInfo.getPointBalances();
+        if (points != null) {
+            for (com.paytronix.client.android.api.Balance balance : points) {
+                addBalance(balance);
+            }
+        }
+    }
+
+    private void addBalance(com.paytronix.client.android.api.Balance balance) {
+        if (balance == null) {
+            return;
+        }
+        Map<String, String> curGroupMap = new HashMap<String, String>();
+        groupData.add(curGroupMap);
+        curGroupMap.put(NAME, balance.getName());
+        curGroupMap.put(BALANCE, balance.getBalance().toString());
+        List<Expiration> expirations = balance.getExpirations();
+        List<Map<String, String>> children = new ArrayList<Map<String, String>>();
+        if (expirations != null) {
+            for (Expiration expiration : expirations) {
+                Map<String, String> curChildMap = new HashMap<String, String>();
+                children.add(curChildMap);
+                BigDecimal amount = expiration.getAmount();
+                String expirationDate = expiration.getExpirationDate().toString();
+                String suffix = "s";
+                if (amount.compareTo(new BigDecimal(1)) > 0) {
+                    suffix = "";
+                }
+                curChildMap.put(EXPIRATION, amount.toString() + " expire" + suffix + " on "
+                        + expirationDate);
+            }
+        }
+        childData.add(children);
+    }
+
+    private class PullMessages extends AsyncTask<Void, Void, Object> {
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+            
+            if (!AppUtil.isConnected(Balance.this)) {
+                AppUtil.notConnectedToast(Balance.this);
+                this.cancel(true);
+                return;
+            }
+
+            if (sCheckMessages != null) {
+
+                Calendar rightNow = Calendar.getInstance();
+
+                if (rightNow.getTimeInMillis() - sCheckMessages.getTimeInMillis()
+                < THREE_MINUTES) {
+                    this.cancel(true);
+                }
+            }
+
+        }
+
+        @Override
+        protected Object doInBackground(Void... params) {
+
+            ArrayList<Message> list = new ArrayList<Message>();
+
+            try {
+
+                JSONObject json = AppUtil.sPxAPI.getMyMessages(Balance.this,
+                        AppUtil.sPxAPI.getTokenInfo().getUsername());
+
+                if (json != null) {
+                    JSONArray array = null;
+
+                    if (json.has("messages")) {
+                        array = json.getJSONArray("messages");
+                        for (int i = 0; i < array.length(); i++) {
+                            list.add(MessageJSON.fromJSON(array.getJSONObject(i)));
+                        }
+                    }
+                }
+
+            } catch (PxException e) {
+                return e;
+            } catch (JSONException e) {
+                return e;
+            }
+
+            return list;
+        }
+
+        @Override
+        protected void onPostExecute(Object result) {
+            super.onPostExecute(result);
+
+            if (result == null) {
+                mTask = null;
+                runQueue();
+                return;
+            }
+
+            if (result != null) {
+                if (result instanceof Exception) {
+                    Toast.makeText(Balance.this, ((Exception)result).getMessage(),
+                            Toast.LENGTH_LONG).show();
+                    mTask = null;
+                    return;
+                }
+
+                Button btn = (Button)findViewById(R.id.messages_button);
+                btn.setVisibility(View.GONE);
+                if (((List<Message>)result).size() > 0) {
+                    btn.setVisibility(View.VISIBLE);
+                    if (((List<Message>)result).size() == 1) {
+                        btn.setText(((List<Message>)result).size() + " " + getResources()
+                                .getString(R.string.messages_button_label_singular));
+                    }
+                    else {
+                        btn.setText(((List<Message>)result).size() + " " + getResources()
+                                .getString(R.string.messages_button_label_plural));
+                    }
+
+                }
+                else {
+
+                    btn.setText(R.string.messages_button_label_none);
+                }
+            }
+
+            mTask = null;
+            runQueue();
+        }
+
+    }
+
+    private class RetrieveAccountInformation extends AsyncTask<Void, Void, Object> {
+
+        private ProgressDialog mProgressDialog;
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+
+            if (!AppUtil.isConnected(Balance.this)) {
+                AppUtil.notConnectedToast(Balance.this);
+                this.cancel(true);
+                return;
+            }
+
+            if (sCheckAccountInformation != null) {
+
+                Calendar rightNow = Calendar.getInstance();
+
+                if (rightNow.getTimeInMillis() - sCheckAccountInformation.getTimeInMillis()
+                < TEN_MINUTES) {
+                    this.cancel(true);
+                }
+
+            }
+
+            mProgressDialog = AppUtil.showProgressDialog(Balance.this,
+                    R.string.loading_title_label,
+                    R.string.loading_title_label, this);
+            mProgressDialog.show();
+        }
+
+        @Override
+        protected void onCancelled() {
+            super.onCancelled();
+            if (mProgressDialog != null) {
+                mProgressDialog.dismiss();
+                mProgressDialog = null;
+            }
+            mTask = null;
+        }
+
+        @Override
+        protected Object doInBackground(Void... params) {
+
+            AccountInformation results = null;
+
+            try {
+
+                if (!this.isCancelled()) {
+                    results = AppUtil.sPxAPI.getAccountInformation(Balance.this);
+                }
+
+            } catch (IOException e) {
+                return e;
+            } catch (PxException e) {
+                return e;
+            } catch (PxInvalidTokenException e) {
+                return e;
+            }
+
+            return results;
+
+        }
+
+        @Override
+        protected void onPostExecute(Object result) {
+            super.onPostExecute(result);
+
+            if (mProgressDialog != null) {
+                mProgressDialog.dismiss();
+                mProgressDialog = null;
+            }
+
+            if (result instanceof IOException) {
+
+                Toast.makeText(Balance.this, ((IOException)result).getMessage(),
+                        Toast.LENGTH_LONG).show();
+                mTask = null;
+                runQueue();
+                return;
+
+            }
+
+            if (result instanceof PxException) {
+                Toast.makeText(Balance.this, ((PxException)result).getMessage(),
+                        Toast.LENGTH_LONG).show();
+                mTask = null;
+                runQueue();
+                return;
+            }
+
+            if (result instanceof PxInvalidTokenException) {
+
+                mTask = null;
+                runQueue();
+                return;
+            }
+
+            mAccInfo = (AccountInformation)result;
+            fillData(mAccInfo);
+            if (mAdapter != null) {
+                mAdapter.notifyDataSetChanged();
+            }
+
+            mTask = null;
+            runQueue();
+
+        }
+
+    }
+
+    public void initialUISetup() {
+
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        setContentView(R.layout.balance);
+        Button btn=null;
+        
+
+        //if SSO is configured for merchant then  map button is removed from bottombar 
+        // else TPAuth button is removed 
+        
+        String isSSO=getString(R.bool.is_sso_configured);
+        Boolean isSSOConfigured=new Boolean(isSSO);
+        
+        if(isSSOConfigured.booleanValue()){
+        	btn = (Button)findViewById(R.id.mapbtn);
+        	btn.setVisibility(View.GONE);
+        }else{
+        	btn = (Button)findViewById(R.id.TPAuthbtn);
+        	btn.setVisibility(View.GONE);
+        }
+
+        btn = (Button)findViewById(R.id.homebtn);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(Balance.this, Home.class).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+            }
+
+        });
+
+        btn = (Button)findViewById(R.id.locationbtn);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(Balance.this, LocationsList.class).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+            }
+
+        });
+
+        btn = (Button)findViewById(R.id.mapbtn);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+                startActivity(new Intent(Balance.this, LocationsMap.class).addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT));
+            }
+
+        });
+
+        select = (ToggleButton)findViewById(R.id.accountbtn);
+        select.setPressed(true);
+        select.setClickable(false);
+
+      //mapping the action listener to the TPAuth button 
+
+        View tpAuthView=findViewById(R.id.TPAuthbtn);
+               if(tpAuthView!=null){
+               btn = (Button)tpAuthView;
+               btn.setOnClickListener(new OnClickListener() {
+
+                   @Override
+                   public void onClick(View v) {
+                   TPAuthProcess tpAuthProcessor=new TPAuthProcess();
+                   tpAuthProcessor.process((Activity)Balance.this);
+                   }
+
+               });
+               }
+        
+        btn = (Button)findViewById(R.id.refreshbtn);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+                mQ.add(new RetrieveAccountInformation());
+                mQ.add(new PullMessages());
+                runQueue();
+            }
+
+        });
+
+        btn = (Button)findViewById(R.id.recharge_activity_button);
+
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View arg0) {
+            	rechargeAccount();
+            }
+        });
+
+        btn = (Button)findViewById(R.id.messages_button);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+
+                Intent intent = new Intent(Balance.this, Messages.class);
+                Bundle extras = new Bundle();
+                extras.putString(Messages.USERNAME, mAccInfo.getUsername());
+                intent.putExtras(extras);
+                startActivity(intent);
+            }
+
+        });
+
+        btn = (Button)findViewById(R.id.switch_btn);
+        btn.setOnClickListener(new OnClickListener() {
+
+            @Override
+            public void onClick(View arg0) {
+                startActivity(new Intent(Balance.this, SignIn.class));
+            }
+
+        });
+
+    }
+
+    /*
+     * Determines if the user's email address is verified
+     * If not, prompts for the user to send a verification email
+     * and verify the account.
+     * Otherwise, starts the reload activity
+     */
+    private void rechargeAccount() {
+		
+    	if (userInfo == null || userInfo.getFields() == null || userInfo.getFields().getEmailVerified() == null) {
+    		//start the activity anyway and throw the user email not verified error if it happens
+    		startActivity(new Intent(Balance.this, RechargeActivity.class));
+    	} else if (userInfo.getFields().getEmailVerified()) {
+    		startActivity(new Intent(Balance.this, RechargeActivity.class));
+		} else {
+    		AlertDialog.Builder builder = new AlertDialog.Builder(this);
+
+    	    builder.setTitle(Balance.this.getString(R.string.recharge_unverified_email_title));
+    	    builder.setMessage(Balance.this.getString(R.string.recharge_unverified_email_message));
+
+    	    builder.setPositiveButton("YES", new DialogInterface.OnClickListener() {
+
+    	        public void onClick(DialogInterface dialog, int which) {
+    	        	new SendVerificationEmail().execute();	//Use an AsyncTask to send the email so that we don't tie up the UI thread
+    	        	dialog.dismiss();
+    	        }
+    	    });
+
+    	    builder.setNegativeButton("NO", new DialogInterface.OnClickListener() {
+
+    	        @Override
+    	        public void onClick(DialogInterface dialog, int which) {
+    	        	Toast.makeText(Balance.this, R.string.recharge_unverified_email_cannot_continue,
+                            Toast.LENGTH_LONG).show();
+    	            dialog.dismiss();
+    	        }
+    	    });
+
+    	    AlertDialog alert = builder.create();
+    	    alert.show();
+    	}
+    	
+		return;
+	}
+    
+    
+    private class SendVerificationEmail extends AsyncTask<Void, Void, Object> {
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+            
+            if (!AppUtil.isConnected(Balance.this)) {
+                AppUtil.notConnectedToast(Balance.this);
+                this.cancel(true);
+                return;
+            }
+            
+            Toast.makeText(Balance.this, R.string.recharge_notification_sending_email, Toast.LENGTH_SHORT).show();
+        }
+
+        @Override
+        protected Object doInBackground(Void... thing) {
+        	try {
+        		return AppUtil.sPxAPI.sendVerificationEmail(Balance.this, AppUtil.sPxAPI.getTokenInfo().getUsername());
+				}
+			 //Note: Starting in java 7 we can do catch multiple exceptions in a single statement.
+			 //Should consider this when/if we move to 1.7
+			 catch (Exception e) {
+			   	 return e;
+			    }
+        }
+
+        @Override
+        protected void onPostExecute(Object result) {
+            super.onPostExecute(result);
+         
+            if(result == null){
+            	return;
+            }
+            
+            if(result instanceof Exception){
+            	Exception e = (Exception)result;
+            	Toast.makeText(Balance.this, e.getMessage(),
+		                   Toast.LENGTH_LONG).show();
+            }else if (result instanceof String && !((String)result).equals("") ){
+            	String email = (String)result;
+            	Toast.makeText(Balance.this, Balance.this.getString(R.string.recharge_unverified_email_sent_email_prefix).trim() + " " + email,
+			               Toast.LENGTH_LONG).show();
+            }
+            
+        }
+
+    }
+    
+    
+    
+
+	@Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putSerializable(IntentExtraKeys.PXCONTEXT_EXTRA, AppUtil.sPxAPI);
+
+    }
+
+    private class RetrievePaymentConfigurationTask extends AsyncTask<Void, Void, Object> {
+
+        private String mCardTemplateCode;
+        private PaymentConfig mConfig;
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+
+            if (!AppUtil.isConnected(Balance.this)) {
+                AppUtil.notConnectedToast(Balance.this);
+                this.cancel(true);
+                return;
+            }
+
+            SharedPreferences sharedPref =
+                    PreferenceManager.getDefaultSharedPreferences(Balance.this);
+
+            String server_selection_url = sharedPref.getString(AppUtil.SERVER_KEY,
+                    Balance.this.getString(R.string.server_selection_default));
+
+            String[] cardCode = Balance.this.getResources()
+                    .getStringArray(R.array.card_template_code);
+
+            String[] serverUrls = Balance.this.getResources().getStringArray(R.array.server_url);
+
+            if (server_selection_url.equals(serverUrls[0])) {
+                mCardTemplateCode = cardCode[0];
+            }
+            else if (server_selection_url.equals(serverUrls[1])) {
+                mCardTemplateCode = cardCode[1];
+            }
+            else if (server_selection_url.equals(serverUrls[2])) {
+                mCardTemplateCode = cardCode[2];
+            }
+        }
+
+        @Override
+        protected void onCancelled() {
+            super.onCancelled();
+            mTask = null;
+        }
+
+        @Override
+        protected Object doInBackground(Void... params) {
+
+            try {
+
+                mConfig = AppUtil.sPxAPI.getPaymentConfig(Balance.this, mCardTemplateCode);
+
+            } catch (PxException e) {
+                return e;
+            }
+
+            return null;
+        }
+
+        @Override
+        protected void onPostExecute(Object result) {
+            super.onPostExecute(result);
+
+            if (result instanceof Exception) {
+
+                Log.e(TAG, ((Exception)result).toString());
+
+                mTask = null;
+                runQueue();
+
+                return;
+            }
+
+            if (mConfig != null && Balance.this.getResources().getBoolean(R.bool.is_recharge_enabled)) {	//We assume that if a PaymentConfig is created for the merchant they can do recharge
+                    Button btn = (Button)findViewById(R.id.recharge_activity_button);
+                    btn.setVisibility(View.VISIBLE);
+            }
+            else {
+
+                if (mRetryCountPaymentConfiguration < 2) {
+                    mQ.add(new RetrievePaymentConfigurationTask());
+                    mRetryCountPaymentConfiguration++;
+                } else {
+                    mRetryCountPaymentConfiguration = 0;
+                }
+            }
+
+            mTask = null;
+            runQueue();
+        }
+
+    }
+    
+    /*
+     * Used to get userInformation which in turn tells us if 
+     * the user's email has been verified. Do this every time the Balance
+     * activity is run.
+     */
+    private class RetrieveUserInformation extends AsyncTask<Void, Void, Object> {
+
+        private ProgressDialog mProgressDialog;
+
+        @Override
+        protected void onPreExecute() {
+            super.onPreExecute();
+
+            if (!AppUtil.isConnected(Balance.this)) {
+                AppUtil.notConnectedToast(Balance.this);
+                this.cancel(true);
+                return;
+            }
+            
+          
+            mProgressDialog = AppUtil.showProgressDialog(Balance.this,
+                    R.string.loading_title_label,
+                    R.string.loading_title_label, this);
+            mProgressDialog.show();
+        }
+
+        @Override
+        protected void onCancelled() {
+            super.onCancelled();
+            if (mProgressDialog != null) {
+                mProgressDialog.dismiss();
+                mProgressDialog = null;
+            }
+            mTask = null;
+        }
+
+        @Override
+        protected Object doInBackground(Void... params) {
+
+            UserInformation results = null;
+
+            try {
+
+                if (!this.isCancelled()) {
+                    results = AppUtil.sPxAPI.getUserInformation(Balance.this, AppUtil.sPxAPI.getTokenInfo().getUsername());
+                }
+            }catch (IOException e) {
+            	Log.e("Balance-Recharge", e.getMessage());
+		        return e;
+		    } catch (PxException e) {
+		    	Log.e("Balance-Recharge", e.getMessage());
+		        return e;
+		    } catch (PxInvalidTokenException e) {
+		    	Log.e("Balance-Recharge", e.getMessage());
+		        return e;
+		    }
+            
+            
+            return results;
+
+        }
+
+        @Override
+        protected void onPostExecute(Object result) {
+            super.onPostExecute(result);
+
+            if (mProgressDialog != null) {
+                mProgressDialog.dismiss();
+                mProgressDialog = null;
+            }
+
+            if (result instanceof IOException) {
+
+                Toast.makeText(Balance.this, ((IOException)result).getMessage(),
+                        Toast.LENGTH_LONG).show();
+                mTask = null;
+                runQueue();
+                return;
+
+            }
+
+            if (result instanceof PxException) {
+                Toast.makeText(Balance.this, ((PxException)result).getMessage(),
+                        Toast.LENGTH_LONG).show();
+                mTask = null;
+                runQueue();
+                return;
+            }
+
+            if (result instanceof PxInvalidTokenException) {
+
+                mTask = null;
+                runQueue();
+                return;
+            }
+            
+            userInfo = (UserInformation)result;
+            
+            mTask = null;
+            runQueue();
+        }
+
+    }
+
+    public void runQueue() {
+
+        if (mTask == null) {
+            select.setPressed(true);
+            if (!mQ.isEmpty()) {
+                mTask = mQ.poll();
+                mTask.execute();
+            }
+
+        }
+    }
+    
+    @Override
+    public void onResume(){
+    	super.onResume();
+
+        select.setPressed(true);
+    	
+        //Update pull messages and account balance each time activity regains focus
+    	mQ.add(new PullMessages());
+    	mQ.add(new RetrieveAccountInformation());
+    	
+    	//Get the user information only if it wasn't retrieved before, or the user's email wasn't verified
+    	//We really only care about the userInfo for the recharge activity
+    	if(userInfo == null || (userInfo != null && userInfo.getFields() != null && !userInfo.getFields().getEmailVerified())){
+    		mQ.add(new RetrieveUserInformation());
+    	}
+    	
+    	runQueue();
+    }
+    
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        
+        this.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+    }
+}
